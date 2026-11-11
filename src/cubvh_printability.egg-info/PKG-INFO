@@ -1,0 +1,68 @@
+Metadata-Version: 2.1
+Name: cubvh-printability
+Version: 0.1.0
+Summary: Standalone Python client for cubvh printability repair
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+
+# cubvh-printability
+
+`cubvh-printability` contains the Python printability orchestration migrated out of
+`cubvh`. It uses the installed [`cubvh`](../) package for cuBVH and sparse CUDA
+backend primitives; the OptiX helper sources are packaged here so this feature can
+be installed and invoked independently. Import printability APIs from
+`cubvh_printability`; the `cubvh` package itself exposes only its core backend.
+
+## Install
+
+Install `cubvh` and its CUDA dependencies first, then install this client:
+
+```bash
+python -m pip install -e ./cubvh_printability
+```
+
+## Python API
+
+```python
+from cubvh_printability import PrintabilityConfig, PrintabilityClient
+
+config = PrintabilityConfig(
+    min_thickness=0.05,
+    size=50.0,
+    resolution=1536,
+    max_iso_scale=2.0,
+    # Set a positive value to enable the geometry-change guard.
+    max_geometry_change_ratio=None,
+    min_silhouette_iou=0.98,
+)
+result = PrintabilityClient().check_printability(
+    "input.glb", config, output_path="repaired.ply"
+)
+print(result["printable"], result["failure_reason"])
+```
+
+A function-style API is also available:
+
+```python
+from cubvh_printability import check_printability
+result = check_printability(
+    "input.glb", min_thickness=0.05, size=50.0,
+    max_iso_scale=2.0, output_path="repaired.ply",
+)
+```
+
+For an already constructed configuration, `repair_mesh(mesh, config,
+output_path=...)` is an equivalent named helper.
+
+## CLI
+
+```bash
+cubvh-printability input.glb \
+  --min-thickness 0.05 --size 50 \
+  --max-iso-scale 2 --output repaired.ply
+```
+
+The geometry-change guard is disabled by default; pass a positive `max_geometry_change_ratio` to enable it.
+
+The client imports `cubvh` lazily, so importing this package does not initialize
+CUDA. A clear runtime error is raised if cubvh or its native dependencies are missing.

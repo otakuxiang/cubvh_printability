@@ -1,0 +1,2 @@
+[console_scripts]
+cubvh-printability = cubvh_printability.cli:main

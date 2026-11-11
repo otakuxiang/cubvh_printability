@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cubvh-printability"
+version = "0.1.0"
+description = "Standalone Python client for cubvh printability repair"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["cubvh>=0.1.2", "numpy", "trimesh"]
+
+[project.scripts]
+cubvh-printability = "cubvh_printability.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cubvh_printability = ["optix_src/*.h", "optix_src/*.cpp", "optix_src/*.cu"]
