@@ -14,6 +14,9 @@ class PrintabilityConfig:
 
     Lengths are millimetres.  The defaults mirror the current cubvh API while
     keeping all policy choices explicit at the wrapper boundary.
+    Repair acceptance uses measured thickness; max_iso_scale bounds growth.
+    max_geometry_change_ratio and min_silhouette_iou are legacy options and
+    no longer enable camera checks.
     """
 
     min_thickness: float
@@ -24,6 +27,7 @@ class PrintabilityConfig:
     max_iso_scale: float = 3.0
     max_geometry_change_ratio: float | None = None
     min_silhouette_iou: float = 0.98
+    repair_strategy: str = "global"
 
     def __post_init__(self) -> None:
         _positive("min_thickness", self.min_thickness)
@@ -39,6 +43,8 @@ class PrintabilityConfig:
         _positive("max_iso_scale", self.max_iso_scale)
         if self.max_geometry_change_ratio is not None:
             _positive("max_geometry_change_ratio", self.max_geometry_change_ratio)
+        if self.repair_strategy not in ("global", "parts"):
+            raise ValueError("repair_strategy must be 'global' or 'parts'")
 
     def as_kwargs(self, output_path: str | Path | None = None) -> dict[str, Any]:
         """Return keyword arguments accepted by the migrated implementation."""
@@ -52,6 +58,7 @@ class PrintabilityConfig:
             "max_iso_scale": self.max_iso_scale,
             "max_geometry_change_ratio": self.max_geometry_change_ratio,
             "min_silhouette_iou": self.min_silhouette_iou,
+            "repair_strategy": self.repair_strategy,
         }
 
 
@@ -108,6 +115,7 @@ def check_printability(
     max_iso_scale: float = 3.0,
     max_geometry_change_ratio: float | None = None,
     min_silhouette_iou: float = 0.98,
+    repair_strategy: str = "global",
 ) -> dict[str, Any]:
     """Convenience function with the same policy parameters as cubvh."""
     config = PrintabilityConfig(
@@ -119,6 +127,7 @@ def check_printability(
         max_iso_scale=max_iso_scale,
         max_geometry_change_ratio=max_geometry_change_ratio,
         min_silhouette_iou=min_silhouette_iou,
+        repair_strategy=repair_strategy,
     )
     return PrintabilityClient().check_printability(mesh_path, config, output_path=output_path)
 

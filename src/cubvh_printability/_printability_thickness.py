@@ -14,6 +14,9 @@ def _component_geometry(mesh, chunk_size=262144):
     Scalar edge sorting and a three-neighbor CSR avoid Trimesh's full edge,
     adjacency, triangle and submesh caches. Point-touching shells stay separate.
     """
+    cached = mesh._cache['printability_components']
+    if cached is not None:
+        return cached
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import connected_components
     faces, vertices = np.asarray(mesh.faces), np.asarray(mesh.vertices)
@@ -61,7 +64,9 @@ def _component_geometry(mesh, chunk_size=262144):
         volumes += np.bincount(component, weights=signed, minlength=count)
         selected = areas[start:stop] == maxima[component]
         np.minimum.at(representatives, component[selected], np.arange(start, stop)[selected])
-    return labels, volumes, representatives
+    result = labels, volumes, representatives
+    mesh._cache['printability_components'] = result
+    return result
 
 
 class MaterialQuery:
@@ -178,14 +183,18 @@ class WallExitFilter:
     """
     def __init__(self, mesh, device, torch):
         self.torch = torch
-        vertices, faces = np.asarray(mesh.vertices), np.asarray(mesh.faces)
+        # Construct normals on the query device in float64, preserving the
+        # CPU geometry precision before the existing float32 ray predicate.
+        # Avoid rebuilding millions of face normals on the CPU each round.
+        vertices = torch.as_tensor(np.asarray(mesh.vertices), device=device, dtype=torch.float64)
+        faces = torch.as_tensor(np.asarray(mesh.faces), device=device, dtype=torch.int64)
         self.normals = torch.empty((len(faces), 3), device=device, dtype=torch.float32)
         for start in range(0, len(faces), 262144):
             tri = vertices[faces[start:start + 262144]]
-            normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
-            length = np.linalg.norm(normals, axis=1, keepdims=True)
-            normals = np.divide(normals, length, out=np.zeros_like(normals), where=length > 0)
-            self.normals[start:start + len(tri)] = torch.as_tensor(normals, device=device, dtype=torch.float32)
+            normals = torch.linalg.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0], dim=1)
+            length = torch.linalg.vector_norm(normals, dim=1, keepdim=True)
+            normals = torch.where(length > 0, normals / length, 0.)
+            self.normals[start:start + len(tri)] = normals.float()
 
     def accepted_exits(self, hits, distances, directions, inward):
         torch = self.torch
@@ -239,7 +248,8 @@ class WallExitFilter:
 
 def measure(mesh, min_thickness, *, sample_count=200_000, seed=20261110,
             batch_size=DEFAULT_THICKNESS_BATCH_SIZE,
-            max_normal_angle_deg=DEFAULT_MAX_NORMAL_ANGLE_DEG, require_opposing_surfaces=True):
+            max_normal_angle_deg=DEFAULT_MAX_NORMAL_ANGLE_DEG, require_opposing_surfaces=True,
+            return_profile=False, diagnostics=False, return_samples=False):
     """Normal wall span with multi-direction support for thin; unknown is thin."""
     import torch
     scale = float(np.max(mesh.extents))
@@ -253,11 +263,15 @@ def measure(mesh, min_thickness, *, sample_count=200_000, seed=20261110,
     # Material-oriented component volumes handle inverted shells and cavities.
     volume = 0.0
     volume_known = True
+    unknown_component_orientations = 0
+    orientation_mismatch_samples = 0
     started = time.perf_counter()
     labels, volumes, representatives = _component_geometry(mesh)
     logging.getLogger(__name__).info('Component geometry: %d shells in %.2fs', len(volumes), time.perf_counter() - started)
     expected_minus = np.empty(len(volumes), dtype=bool)
+    component_known = np.zeros(len(volumes), dtype=bool)
     vertices, mesh_faces = np.asarray(mesh.vertices), np.asarray(mesh.faces)
+    areas = face_areas(mesh)
     for start in range(0, len(representatives), batch_size):
         triangles = vertices[mesh_faces[representatives[start:start + batch_size]]]
         normals = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
@@ -265,18 +279,55 @@ def measure(mesh, min_thickness, *, sample_count=200_000, seed=20261110,
         point = torch.tensor(triangles.mean(axis=1) / scale, device=device, dtype=torch.float32)
         normal = torch.tensor(normals, device=device, dtype=torch.float32)
         _, known, minus = _material_side(query, point, normal, epsilon)
-        volume_known &= bool(known.all().item())
+        component_known[start:start + len(triangles)] = known.cpu().numpy()
         expected_minus[start:start + len(triangles)] = minus.cpu().numpy()
+    initial_unknown_component_orientations = int((~component_known).sum())
+    # A single representative can lie at a numerically ambiguous contact.
+    # Retry other large faces of that same closed shell; never discard the
+    # shell or infer its sign from winding alone. Conflicting known probes
+    # remain unresolved, and all ordinary area-uniform checks still run below.
+    for component in np.flatnonzero(~component_known):
+        candidates = np.flatnonzero(labels == component)
+        candidates = candidates[candidates != representatives[component]]
+        candidates = candidates[np.argsort(-areas[candidates], kind='stable')[:8]]
+        if not len(candidates):
+            continue
+        triangles = vertices[mesh_faces[candidates]]
+        normals = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+        normals /= np.linalg.norm(normals, axis=1, keepdims=True)
+        points = torch.tensor(triangles.mean(axis=1) / scale, device=device, dtype=torch.float32)
+        normals = torch.tensor(normals, device=device, dtype=torch.float32)
+        _, known, minus = _material_side(query, points, normals, epsilon)
+        observed = minus[known]
+        if len(observed) and bool((observed == observed[0]).all().item()):
+            component_known[component] = True
+            expected_minus[component] = bool(observed[0].item())
+    unknown_component_orientations = int((~component_known).sum())
+    volume_known &= unknown_component_orientations == 0
     volume = float(np.dot(volumes, np.where(expected_minus, 1., -1.)))
     rng = np.random.default_rng(seed)
-    areas = face_areas(mesh)
     face_ids = rng.choice(len(mesh.faces), sample_count, p=areas / areas.sum())
     bary = rng.random((sample_count, 2))
     root = np.sqrt(bary[:, 0])
     weights = np.column_stack((1 - root, root * (1 - bary[:, 1]), root * bary[:, 1]))
+    # Keep the first sample_count area-uniform samples for unbiased acceptance.
+    # Add three interior samples on every face absent from that draw so small
+    # triangles cannot silently be treated as thick. Profile-only samples do
+    # not enter the area-uniform estimator.
+    if return_profile:
+        missing = np.flatnonzero(np.bincount(face_ids, minlength=len(mesh.faces)) == 0)
+        face_ids = np.r_[face_ids, np.repeat(missing, 3)]
+        weights = np.concatenate((weights, np.tile(
+            [[.6, .2, .2], [.2, .6, .2], [.2, .2, .6]], (len(missing), 1))))
+    query_count = len(face_ids)
     thin_count = 0
     measured_count = 0
-    for start in range(0, sample_count, batch_size):
+    retain_samples = return_profile or return_samples
+    sample_thickness = np.full(query_count, np.nan, dtype=np.float32) if retain_samples else None
+    sample_valid = np.zeros(query_count, dtype=bool) if retain_samples else None
+    sample_opposite = np.full(query_count, -1, dtype=np.int64) if retain_samples else None
+    sample_inward = np.empty((sample_count, 3), dtype=np.float32) if return_samples else None
+    for start in range(0, query_count, batch_size):
         ids = face_ids[start:start + batch_size]
         triangles = vertices[mesh_faces[ids]] / scale
         points = torch.tensor(np.einsum('ni,nij->nj', weights[start:start + batch_size], triangles),
@@ -288,7 +339,9 @@ def measure(mesh, min_thickness, *, sample_count=200_000, seed=20261110,
         expected = torch.tensor(expected_minus[labels[ids]], device=device)
         # Overlapping/self-intersecting shells can change material orientation
         # within one connected component. Such samples invalidate its volume.
-        volume_known &= not bool(((minus != expected) & classified).any().item())
+        mismatch_count = int(((minus != expected) & classified).sum().item())
+        orientation_mismatch_samples += mismatch_count
+        volume_known &= mismatch_count == 0
         directions = thickness_directions(inward, torch, max_normal_angle_deg)
         ray_count = directions.shape[1]
         origins = points[:, None] + epsilon * directions
@@ -303,10 +356,77 @@ def measure(mesh, min_thickness, *, sample_count=200_000, seed=20261110,
             exits = (faces.reshape(-1, ray_count) >= 0).all(dim=1)
             minimum = distances.reshape(-1, ray_count).min(dim=1).values
             thickness = (minimum + epsilon) * scale
-        valid = classified & exits
+        valid = classified & exits & torch.isfinite(thickness)
         if min_thickness <= 4 * epsilon * scale:
             valid = torch.zeros_like(valid)
-        thin_count += int(((thickness < min_thickness) | ~valid).sum().item())
-        measured_count += int(valid.sum().item())
-    return {'thin_wall_area_ratio': thin_count / sample_count, 'volume': volume,
-            'reliable': bool(volume_known and np.isfinite(volume) and volume > 0 and measured_count > 0)}
+        uniform_count = max(0, min(len(valid), sample_count - start))
+        thin_count += int(((thickness[:uniform_count] < min_thickness) | ~valid[:uniform_count]).sum().item())
+        measured_count += int(valid[:uniform_count].sum().item())
+        if retain_samples:
+            stop = start + len(thickness)
+            sample_thickness[start:stop] = thickness.detach().cpu().numpy()
+            sample_valid[start:stop] = valid.detach().cpu().numpy()
+            sample_opposite[start:stop] = faces.reshape(-1, ray_count)[:, 0].detach().cpu().numpy()
+        if return_samples and uniform_count:
+            sample_inward[start:start+uniform_count] = inward[:uniform_count].detach().cpu().numpy()
+    result = {'thin_wall_area_ratio': thin_count / sample_count, 'volume': volume,
+              'reliable': bool(volume_known and np.isfinite(volume) and volume > 0 and measured_count > 0)}
+    if diagnostics:
+        result['reliability_details'] = {
+            'initial_unknown_component_orientations': initial_unknown_component_orientations,
+            'unknown_component_orientations': unknown_component_orientations,
+            'orientation_mismatch_samples': orientation_mismatch_samples,
+            'queried_samples': query_count,
+            'measured_uniform_samples': measured_count,
+            'uniform_samples': sample_count,
+            'positive_finite_volume': bool(np.isfinite(volume) and volume > 0),
+        }
+    if return_samples:
+        # Preserve the exact area-uniform acceptance draw. No additional
+        # per-face coverage queries are needed for a reconstruction audit.
+        result['samples'] = {
+            'face_ids': face_ids[:sample_count].copy(),
+            'bary': weights[:sample_count].copy(),
+            'thickness': sample_thickness[:sample_count].copy(),
+            'valid': sample_valid[:sample_count].copy(),
+            'opposite_faces': sample_opposite[:sample_count].copy(),
+            'inward': sample_inward,
+        }
+    if return_profile:
+        face_thickness = np.full(len(mesh.faces), np.nan, dtype=np.float32)
+        valid_samples = sample_valid & np.isfinite(sample_thickness)
+        order = np.lexsort((sample_thickness[valid_samples], face_ids[valid_samples]))
+        ids = face_ids[valid_samples][order]
+        values = sample_thickness[valid_samples][order]
+        starts = np.r_[0, np.flatnonzero(ids[1:] != ids[:-1]) + 1] if len(ids) else np.empty(0, dtype=np.int64)
+        ends = np.r_[starts[1:], len(ids)] if len(starts) else np.empty(0, dtype=np.int64)
+        rank = .1 * (ends - starts - 1)
+        low = np.floor(rank).astype(np.int64)
+        fraction = rank - low
+        if len(starts):
+            face_thickness[ids[starts]] = (values[starts + low] * (1 - fraction)
+                + values[np.minimum(starts + low + 1, ends - 1)] * fraction)
+        opposite = np.full(len(mesh.faces), -1, dtype=np.int64)
+        if len(starts):
+            opposite[ids[starts]] = sample_opposite[valid_samples][order][starts + low]
+        face_area = np.asarray(areas, dtype=np.float64)
+        unknown = ~np.isfinite(face_thickness)
+        thin = (~unknown) & (face_thickness < min_thickness)
+        result['face_profile'] = {
+            'thickness': face_thickness,
+            'opposite_faces': opposite,
+            'gap': np.maximum(min_thickness - np.nan_to_num(face_thickness, nan=0.0), 0.0),
+            'unknown': unknown,
+            'thin': thin,
+            'areas': face_area,
+            'thin_area_ratio': float(face_area[thin].sum() / face_area.sum()),
+            'unknown_area_ratio': float(face_area[unknown].sum() / face_area.sum()),
+            'sample_count': int(len(ids)),
+        }
+    return result
+
+
+def measure_profile(mesh, min_thickness, **kwargs):
+    """Return the normal thickness measurement plus a sampled per-face profile."""
+    kwargs['return_profile'] = True
+    return measure(mesh, min_thickness, **kwargs)

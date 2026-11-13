@@ -8,7 +8,14 @@ version = "0.1.0"
 description = "Standalone Python client for cubvh printability repair"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["cubvh>=0.1.2", "numpy", "trimesh"]
+dependencies = ["cubvh>=0.1.2", "numpy", "trimesh", "scipy", "xxhash"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+review = ["Pillow"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [project.scripts]
 cubvh-printability = "cubvh_printability.cli:main"

@@ -17,10 +17,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--threshold", type=float, default=0.1,
                    dest="thin_wall_area_ratio_threshold")
     p.add_argument("--resolution", type=int, default=1536)
-    p.add_argument("--max-iso-scale", type=float, default=3.0)
+    p.add_argument("--max-iso-scale", type=float, default=3.0,
+                   help="cap growth in mm at min_thickness * max_iso_scale / 2")
     p.add_argument("--max-geometry-change-ratio", type=float, default=None,
-                   help="enable the geometry-change guard with a relative depth limit")
-    p.add_argument("--min-silhouette-iou", type=float, default=0.98)
+                   help="legacy compatibility option; view checks are disabled")
+    p.add_argument("--min-silhouette-iou", type=float, default=0.98,
+                   help="legacy compatibility option; view checks are disabled")
+    p.add_argument("--repair-strategy", choices=("global", "parts"), default="global",
+                   help="repair globally or thicken selected thin patches with a local signed field")
     p.add_argument("--no-export", action="store_true",
                    help="run the check without exporting a repaired mesh")
     return p
@@ -37,6 +41,7 @@ def main(argv: list[str] | None = None) -> None:
         max_iso_scale=args.max_iso_scale,
         max_geometry_change_ratio=args.max_geometry_change_ratio,
         min_silhouette_iou=args.min_silhouette_iou,
+        repair_strategy=args.repair_strategy,
     )
     result = PrintabilityClient().check_printability(
         args.mesh, config, output_path=args.output

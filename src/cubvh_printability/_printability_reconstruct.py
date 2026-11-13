@@ -138,6 +138,7 @@ class Reconstructor:
         self.torch, self.Bitmap3D, self.CuMesh = torch, Bitmap3D, CuMesh
         self.mc = sparse_marching_cubes
         self.resolution = resolution
+        self.source_mesh = mesh
         self.scale = float(np.max(mesh.extents))
         # Normalize UDF coordinates to avoid the legacy cuBVH distance bound.
         udf_mesh = mesh.copy()
@@ -150,7 +151,10 @@ class Reconstructor:
         self.udf_faces = np.asarray(udf_mesh.faces)
         self.device = torch.device('cuda', torch.cuda.current_device())
 
-    def reconstruct(self, offset):
+    def reconstruct(self, offset, face_offsets=None):
+        if face_offsets is not None:
+            from ._local_sdf import reconstruct_local
+            return reconstruct_local(self, self.source_mesh, face_offsets)
         torch = self.torch
         res = self.resolution
         radius = offset / self.scale
@@ -167,22 +171,48 @@ class Reconstructor:
         _LOG.info("Filling interior on %d cubed corner grid", res + 1)
         bitmap.fill_interior()
         _LOG.info("Enumerating complete crossing cells")
-        chunks = list(crossing_cells(bitmap, res, torch))
-        if not chunks:
+        # Keep the enumeration result on the host until all slabs have been
+        # scanned.  ``crossing_cells`` yields one CUDA tensor per x-plane; a
+        # list followed by ``torch.cat`` keeps both the per-plane tensors and
+        # the concatenated copy live at the same time.  At 8M cells this is
+        # avoidable GPU residency and can compete with native Thrust buffers.
+        host_chunks = []
+        total_cells = 0
+        for chunk in crossing_cells(bitmap, res, torch):
+            part = chunk.to(dtype=torch.int32).cpu().numpy()
+            if len(part):
+                host_chunks.append(part)
+                total_cells += len(part)
+        if not host_chunks:
             return None
-        cells = torch.cat(chunks)
-        del chunks
+        cells = torch.empty((total_cells, 3), dtype=torch.int32,
+                            device=self.device)
+        cursor = 0
+        for part in host_chunks:
+            stop = cursor + len(part)
+            cells[cursor:stop].copy_(torch.from_numpy(part))
+            cursor = stop
+        del host_chunks, part
         _LOG.info("Crossing cells: %d; querying shared UDF corners", len(cells))
         # Existing sparse MC uses local int32 array offsets; never permit overflow.
         if len(cells) >= (2**31 - 1) // 12:
             raise MemoryError('sparse marching cubes exceeds its local index capacity')
         offsets = torch.tensor(CORNERS, device=self.device, dtype=torch.int64)
         n = res + 1
-        keys = []
-        for chunk in cells.split(CHUNK):
+        # Materialize one compact corner-key array instead of a Python list of
+        # GPU tensors followed by a second ``torch.cat`` allocation.  Keys are
+        # int64 because a (resolution + 1)^3 grid exceeds signed int32 at the
+        # production resolution 1536.  The temporary is released before MC.
+        corner_keys = torch.empty((len(cells), 8), device=self.device,
+                                  dtype=torch.int64)
+        for start in range(0, len(cells), CHUNK):
+            stop = min(start + CHUNK, len(cells))
+            chunk = cells[start:stop]
             corners = chunk[:, None] + offsets
-            keys.append(((corners[..., 0] * n + corners[..., 1]) * n + corners[..., 2]).reshape(-1))
-        keys = torch.unique(torch.cat(keys), sorted=True)
+            corner_keys[start:stop] = ((corners[..., 0] * n + corners[..., 1]) * n +
+                                       corners[..., 2])
+        keys = torch.unique(corner_keys.reshape(-1), sorted=True)
+        del corner_keys
         values = torch.empty(len(keys), device=self.device, dtype=torch.float32)
         # Shared corners queried exactly once: preserve |UDF-r|, change only sign.
         for start in range(0, len(keys), CHUNK):
@@ -205,7 +235,16 @@ class Reconstructor:
         _LOG.info("MC result: %d vertices, %d faces", len(vertices), len(faces))
         if not len(faces):
             return None
-        return trimesh.Trimesh(vertices=(vertices.cpu().numpy().astype(np.float64) * step - half_extent) * self.scale,
+        # ``high_precision=True`` already returns float64.  ``astype`` with
+        # its default copy=True briefly doubled a multi-million-vertex host
+        # allocation after the GPU work had completed.
+        vertex_array = vertices.cpu().numpy()
+        if vertex_array.dtype != np.float64:
+            vertex_array = vertex_array.astype(np.float64, copy=False)
+        vertex_array *= step
+        vertex_array -= half_extent
+        vertex_array *= self.scale
+        return trimesh.Trimesh(vertices=vertex_array,
                                faces=faces.cpu().numpy(), process=False)
 
     def simplify(self, mesh, target):
@@ -215,8 +254,9 @@ class Reconstructor:
                 torch.tensor(np.asarray(mesh.faces), dtype=torch.int32, device=self.device))
         torch.cuda.empty_cache()
         _LOG.info("Simplifying %d faces toward %d", len(mesh.faces), target)
-        cm.simplify_quadric(target, verbose=_LOG.isEnabledFor(logging.INFO), options={'PreserveTopology': True, 'HardNormalCheck': True,
-                                            'NormalCheck': True, 'NormalThrRad': math.pi / 2})
+        cm.simplify_quadric(target, verbose=_LOG.isEnabledFor(logging.INFO), options={
+            'PreserveTopology': True, 'HardNormalCheck': True,
+            'NormalCheck': True, 'NormalThrRad': math.pi / 2, 'Aggressiveness': .2})
         vertices, faces = cm.read()
         # CuMesh stores float32 coordinates. Distinct high-precision MC vertices
         # can coincide on conversion even if the original candidate is valid.

@@ -60,3 +60,72 @@ class FidelityGuard:
         metrics['passed']=bool(metrics['max_depth_p95_ratio'] <= max_depth_ratio
                                and metrics['min_silhouette_iou'] >= min_silhouette_iou)
         return metrics
+
+
+class LocalFidelityGuard:
+    """Whole-object depths plus cumulative close-ups of proposed and actual changes."""
+    def __init__(self, original, size, centers, resolution=256):
+        from .render_review import render_view
+        from .optix import OptixRayTracer
+        self.whole = FidelityGuard(original, size)
+        self.size, self.resolution = size, resolution
+        self.original = original
+        self.centers = [np.asarray(c) for c in centers]
+        self.reference = []
+        tracer = OptixRayTracer(np.asarray(original.vertices), np.asarray(original.faces))
+        for center in centers:
+            for direction in VIEW_DIRECTIONS:
+                self.reference.append(render_view(original, tracer, center,
+                    max(4., .12 * size), direction, resolution))
+
+    def evaluate(self, candidate, max_depth_ratio, min_silhouette_iou):
+        from .render_review import render_view, compare_views, displaced_centers
+        from .optix import OptixRayTracer
+        # Seed area can underweight small ornaments with large distortion.
+        # Retain old cameras and add close-ups from measured surface movement.
+        added = []
+        for center in displaced_centers(self.original, candidate, self.size):
+            if all(np.linalg.norm(np.asarray(center)-c) >= .02*self.size for c in self.centers):
+                self.centers.append(np.asarray(center))
+                added.append(center)
+        if added:
+            reference_tracer = OptixRayTracer(np.asarray(self.original.vertices),
+                                             np.asarray(self.original.faces))
+            for center in added:
+                for direction in VIEW_DIRECTIONS:
+                    self.reference.append(render_view(self.original, reference_tracer, center,
+                        max(4., .12*self.size), direction, self.resolution))
+            del reference_tracer
+        result = self.whole.evaluate(candidate, max_depth_ratio, min_silhouette_iou)
+        tracer = OptixRayTracer(np.asarray(candidate.vertices), np.asarray(candidate.faces))
+        local = []
+        for center in self.centers:
+            for direction in VIEW_DIRECTIONS:
+                after = render_view(candidate, tracer, center, max(4., .12 * self.size),
+                                    direction, self.resolution)
+                before = self.reference[len(local)]
+                metric = compare_views(before, after)
+                # A close-up containing no object in either image has no evidence.
+                if not (np.isfinite(before[1]) | np.isfinite(after[1])).any():
+                    metric['passed'] = True
+                else:
+                    metric['passed'] = bool(metric['silhouette_iou'] >= .95
+                        and metric['depth_p95_mm'] is not None
+                        and metric['depth_p95_mm'] <= min(.25, self.size * max_depth_ratio)
+                        and metric['normal_angle_p95_deg'] <= 30.)
+                local.append(metric)
+        result['local_views'] = local
+        result['local_passed'] = all(m['passed'] for m in local)
+        result['passed'] = bool(result['passed'] and result['local_passed'])
+        return result
+
+
+class FallbackFidelityGuard:
+    """Keep the parts strategy's render gates and cameras across fallback attempts."""
+    def __init__(self, original, size):
+        # Lazy import: the feedback module shares VIEW_DIRECTIONS above.
+        from ._local_feedback import FieldFidelityGuard
+        self.guard = FieldFidelityGuard(original, size)
+
+    def evaluate(self, candidate, max_depth_ratio, min_silhouette_iou):
+        return self.guard.evaluate(candidate, max_depth_ratio, min_silhouette_iou)
