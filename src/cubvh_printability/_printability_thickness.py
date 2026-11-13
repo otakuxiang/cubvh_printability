@@ -246,6 +246,47 @@ class WallExitFilter:
         return normal_span, valid
 
 
+def _aggregate_profile_samples(face_count, face_ids, sample_thickness, sample_valid,
+                               sample_opposite, sample_count, missing):
+    """Exact per-face 10th percentiles without globally sorting extra triplets."""
+    face_thickness = np.full(face_count, np.nan, dtype=np.float32)
+    valid_samples = sample_valid & np.isfinite(sample_thickness)
+    # Extra samples are already grouped as three consecutive samples per
+    # missing face. Sort only the area-uniform draw globally, not tens of
+    # millions of already-grouped samples.
+    uniform_valid = np.flatnonzero(valid_samples[:sample_count])
+    order = uniform_valid[np.lexsort((sample_thickness[uniform_valid],
+                                     face_ids[uniform_valid]))]
+    ids = face_ids[order]
+    values = sample_thickness[order]
+    starts = np.r_[0, np.flatnonzero(ids[1:] != ids[:-1]) + 1] if len(ids) else np.empty(0, dtype=np.int64)
+    ends = np.r_[starts[1:], len(ids)] if len(starts) else np.empty(0, dtype=np.int64)
+    rank = .1 * (ends - starts - 1)
+    low = np.floor(rank).astype(np.int64)
+    fraction = rank - low
+    if len(starts):
+        face_thickness[ids[starts]] = (values[starts + low] * (1 - fraction)
+            + values[np.minimum(starts + low + 1, ends - 1)] * fraction)
+    opposite = np.full(face_count, -1, dtype=np.int64)
+    if len(starts):
+        opposite[ids[starts]] = sample_opposite[order][starts + low]
+    if len(missing):
+        values = sample_thickness[sample_count:].reshape(-1, 3)
+        valid = valid_samples[sample_count:].reshape(-1, 3)
+        local_order = np.argsort(np.where(valid, values, np.inf), axis=1, kind='stable')
+        sorted_values = np.take_along_axis(values, local_order, axis=1)
+        counts = valid.sum(axis=1)
+        rows = np.flatnonzero(counts)
+        fraction = .1 * (counts[rows] - 1)
+        # For 1..3 samples the lower 10th-percentile rank is always zero.
+        high = np.minimum(1, counts[rows] - 1)
+        face_thickness[missing[rows]] = (sorted_values[rows, 0] * (1 - fraction)
+            + sorted_values[rows, high] * fraction)
+        exits = sample_opposite[sample_count:].reshape(-1, 3)
+        opposite[missing[rows]] = exits[rows, local_order[rows, 0]]
+    return face_thickness, opposite, int(valid_samples.sum())
+
+
 def measure(mesh, min_thickness, *, sample_count=200_000, seed=20261110,
             batch_size=DEFAULT_THICKNESS_BATCH_SIZE,
             max_normal_angle_deg=DEFAULT_MAX_NORMAL_ANGLE_DEG, require_opposing_surfaces=True,
@@ -320,6 +361,10 @@ def measure(mesh, min_thickness, *, sample_count=200_000, seed=20261110,
         weights = np.concatenate((weights, np.tile(
             [[.6, .2, .2], [.2, .6, .2], [.2, .2, .6]], (len(missing), 1))))
     query_count = len(face_ids)
+    # Reuse source triangles on the GPU for the millions of profile samples.
+    device_vertices = torch.as_tensor(vertices, device=device, dtype=torch.float64)
+    device_faces = torch.as_tensor(mesh_faces, device=device, dtype=torch.int64)
+    device_expected = torch.as_tensor(expected_minus[labels], device=device)
     thin_count = 0
     measured_count = 0
     retain_samples = return_profile or return_samples
@@ -329,14 +374,16 @@ def measure(mesh, min_thickness, *, sample_count=200_000, seed=20261110,
     sample_inward = np.empty((sample_count, 3), dtype=np.float32) if return_samples else None
     for start in range(0, query_count, batch_size):
         ids = face_ids[start:start + batch_size]
-        triangles = vertices[mesh_faces[ids]] / scale
-        points = torch.tensor(np.einsum('ni,nij->nj', weights[start:start + batch_size], triangles),
-                              device=device, dtype=torch.float32)
-        normal_vectors = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
-        normal_vectors /= np.linalg.norm(normal_vectors, axis=1, keepdims=True)
-        normals = torch.tensor(normal_vectors, device=device, dtype=torch.float32)
+        device_ids = torch.as_tensor(ids, device=device, dtype=torch.int64)
+        triangles = device_vertices[device_faces[device_ids]] / scale
+        barycentric = torch.as_tensor(weights[start:start + batch_size], device=device)
+        points = (barycentric[..., None] * triangles).sum(dim=1).float()
+        normal_vectors = torch.linalg.cross(triangles[:, 1] - triangles[:, 0],
+                                           triangles[:, 2] - triangles[:, 0])
+        normals = (normal_vectors / torch.linalg.vector_norm(
+            normal_vectors, dim=1, keepdim=True)).float()
         inward, classified, minus = _material_side(query, points, normals, epsilon)
-        expected = torch.tensor(expected_minus[labels[ids]], device=device)
+        expected = device_expected[device_ids]
         # Overlapping/self-intersecting shells can change material orientation
         # within one connected component. Such samples invalidate its volume.
         mismatch_count = int(((minus != expected) & classified).sum().item())
@@ -345,7 +392,7 @@ def measure(mesh, min_thickness, *, sample_count=200_000, seed=20261110,
         directions = thickness_directions(inward, torch, max_normal_angle_deg)
         ray_count = directions.shape[1]
         origins = points[:, None] + epsilon * directions
-        source = torch.tensor(ids, device=device, dtype=torch.int64)[:, None].expand(-1, ray_count).reshape(-1)
+        source = device_ids[:, None].expand(-1, ray_count).reshape(-1)
         faces, distances = tracer._trace_trusted(origins.reshape(-1, 3), directions.reshape(-1, 3),
                                         epsilon / 8, 8.0, source)
         if exit_filter is not None:
@@ -393,22 +440,9 @@ def measure(mesh, min_thickness, *, sample_count=200_000, seed=20261110,
             'inward': sample_inward,
         }
     if return_profile:
-        face_thickness = np.full(len(mesh.faces), np.nan, dtype=np.float32)
-        valid_samples = sample_valid & np.isfinite(sample_thickness)
-        order = np.lexsort((sample_thickness[valid_samples], face_ids[valid_samples]))
-        ids = face_ids[valid_samples][order]
-        values = sample_thickness[valid_samples][order]
-        starts = np.r_[0, np.flatnonzero(ids[1:] != ids[:-1]) + 1] if len(ids) else np.empty(0, dtype=np.int64)
-        ends = np.r_[starts[1:], len(ids)] if len(starts) else np.empty(0, dtype=np.int64)
-        rank = .1 * (ends - starts - 1)
-        low = np.floor(rank).astype(np.int64)
-        fraction = rank - low
-        if len(starts):
-            face_thickness[ids[starts]] = (values[starts + low] * (1 - fraction)
-                + values[np.minimum(starts + low + 1, ends - 1)] * fraction)
-        opposite = np.full(len(mesh.faces), -1, dtype=np.int64)
-        if len(starts):
-            opposite[ids[starts]] = sample_opposite[valid_samples][order][starts + low]
+        face_thickness, opposite, valid_count = _aggregate_profile_samples(
+            len(mesh.faces), face_ids, sample_thickness, sample_valid,
+            sample_opposite, sample_count, missing)
         face_area = np.asarray(areas, dtype=np.float64)
         unknown = ~np.isfinite(face_thickness)
         thin = (~unknown) & (face_thickness < min_thickness)
@@ -421,7 +455,7 @@ def measure(mesh, min_thickness, *, sample_count=200_000, seed=20261110,
             'areas': face_area,
             'thin_area_ratio': float(face_area[thin].sum() / face_area.sum()),
             'unknown_area_ratio': float(face_area[unknown].sum() / face_area.sum()),
-            'sample_count': int(len(ids)),
+            'sample_count': valid_count,
         }
     return result
 

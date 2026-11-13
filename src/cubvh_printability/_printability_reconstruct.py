@@ -88,13 +88,12 @@ def filled_corner_field(bvh, bitmap, corners, step, half_extent, radius, torch):
 def crossing_cells(bitmap, resolution, torch):
     """Scan complete filled signs in two-plane slabs, not a sparse support band."""
     device = bitmap.device
-    n = resolution + 1
-    yz = torch.arange(n * n, device=device, dtype=torch.int64)
-    base = torch.stack((torch.zeros_like(yz), yz // n, yz % n), dim=1)
+    # newbit exposes packed (z, y, x-word) data. One snapshot avoids a private
+    # stream query and synchronization for every chunk of every x plane.
+    packed = bitmap.to_tensor()
 
     def plane(x):
-        base[:, 0] = x
-        return torch.cat([_bitmap_get(bitmap, c, torch) for c in base.split(CHUNK)]).reshape(n, n)
+        return (((packed[:, :, x // 64] >> (x % 64)) & 1) != 0).T
 
     previous = plane(0)
     for x in range(resolution):
