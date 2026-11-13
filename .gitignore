@@ -6,3 +6,5 @@ scripts/
 .cache/*
 docs/
 .hypothesis/
+patches/
+tests/

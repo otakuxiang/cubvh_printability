@@ -11,6 +11,14 @@ def test_config_validation_and_kwargs():
     assert kwargs["max_iso_scale"] == 2
     assert kwargs["output_path"] == "out.ply"
     assert kwargs["max_geometry_change_ratio"] is None
+    assert kwargs["repair_strategy"] == "global"
+
+
+def test_parts_repair_strategy_is_validated_and_forwarded():
+    cfg = PrintabilityConfig(min_thickness=0.05, size=50, repair_strategy="parts")
+    assert cfg.as_kwargs()["repair_strategy"] == "parts"
+    with pytest.raises(ValueError):
+        PrintabilityConfig(min_thickness=0.05, size=50, repair_strategy="unknown")
 
 
 def test_client_delegates_without_importing_cuda(tmp_path: Path):
